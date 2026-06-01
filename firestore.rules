@@ -1,0 +1,407 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // Auth tokens do not contain custom claims in this env. We lookup the user document.
+    function getUserData() { 
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; 
+    }
+    
+    function hasRole(role) {
+      return isSignedIn() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             getUserData().get('role', 'student') == role;
+    }
+    
+    function isAdmin() { 
+      // Hardcoded admin email for boot safety + role check
+      return (isSignedIn() && (request.auth.token.email == 'castanar656@gmail.com' || request.auth.token.email == 'admin@letmastery.com')) || hasRole('admin');
+    }
+    
+    function isInstructor() { 
+       return (isSignedIn() && request.auth.token.email == 'instructor@letmastery.com') ||
+              (isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && (
+                getUserData().get('role', 'student') == 'instructor' || 
+                getUserData().get('role', 'student') == 'admin'
+              )) || isAdmin();
+    }
+
+    function isDemoAccount() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        (
+          getUserData().get('isDemo', false) == true ||
+          getUserData().get('email', '') in ['student@letmastery.com', 'instructor@letmastery.com', 'admin@letmastery.com']
+        );
+    }
+    
+    function instructorOwnsClass(classId) {
+      return isInstructor() &&
+        classId is string &&
+        isValidId(classId) &&
+        exists(/databases/$(database)/documents/classes/$(classId)) &&
+        (
+          get(/databases/$(database)/documents/classes/$(classId)).data.instructorId == request.auth.uid ||
+          get(/databases/$(database)/documents/classes/$(classId)).data.instructorEmail == request.auth.token.email ||
+          isAdmin()
+        );
+    }
+    
+    function instructorCanAccessStudent(studentId) {
+      return isAdmin() ||
+        (
+          isInstructor() &&
+          studentId is string &&
+          exists(/databases/$(database)/documents/users/$(studentId)) &&
+          instructorOwnsClass(get(/databases/$(database)/documents/users/$(studentId)).data.get('activeClassId', ''))
+        );
+    }
+    
+    function canReadStudentRecord(studentId) {
+      return isOwner(studentId) || path('/databases/(default)/documents/users/' + request.auth.uid) == path('/databases/(default)/documents/users/' + studentId) || instructorCanAccessStudent(studentId);
+    }
+    
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isOpenAttemptStatus(status) {
+      return status in ['instructions', 'in_progress', 'warning_blocked', 'offline_buffering', 'auto_submitting'];
+    }
+    function isAllowedStudentAttemptStatus(status) {
+      return status in [
+        'instructions',
+        'in_progress',
+        'warning_blocked',
+        'offline_buffering',
+        'auto_submitting',
+        'submitted',
+        'auto_submitted_time_expired',
+        'auto_submitted_warnings',
+        'auto_submitted_idle',
+        'auto_submitted_offline',
+        'flagged_for_review'
+      ];
+    }
+    function isOwnedOpenAttemptUpdate() {
+      return isSignedIn() &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        isOpenAttemptStatus(existing().get('status', 'in_progress')) &&
+        isAllowedStudentAttemptStatus(incoming().get('status', 'in_progress'));
+    }
+    function isValidLearningAnnotation(data) {
+      return data.keys().hasAll(['userId', 'moduleId', 'partId', 'sectionId', 'type', 'text', 'startOffset', 'endOffset']) &&
+        data.userId == request.auth.uid &&
+        data.moduleId is string && isValidId(data.moduleId) &&
+        data.partId is string && isValidId(data.partId) &&
+        data.sectionId is string && data.sectionId.size() > 0 &&
+        data.type in ['highlight', 'hidden', 'note'] &&
+        data.text is string && data.text.size() <= 5000 &&
+        data.startOffset is number &&
+        data.endOffset is number &&
+        data.startOffset >= 0 &&
+        data.endOffset >= data.startOffset &&
+        (!data.keys().hasAny(['hidden']) || data.hidden is bool) &&
+        (!data.keys().hasAny(['note']) || data.note is string) &&
+        (!data.keys().hasAny(['color']) || data.color is string);
+    }
+
+    // --- Entity Validations ---
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'role']) && 
+             data.email is string && data.email.size() <= 200 &&
+             data.role in ['student', 'instructor', 'admin'];
+    }
+
+    // --- RULES ---
+
+    match /users/{userId} {
+      // Allow user to read their own profile, or admins/instructors to read.
+      // We use 'list' allowance for admins to prevent query failures.
+      allow read: if isOwner(userId) || isAdmin() || isInstructor() || (isSignedIn() && resource.data.email == request.auth.token.email);
+      allow list: if isAdmin() || isInstructor() || (isSignedIn() && request.query.filters.email == request.auth.token.email);
+      
+      allow create: if isOwner(userId) && isValidUser(incoming()) || isAdmin();
+      
+      // Allow self-update for non-sensitive fields.
+      allow update: if (isOwner(userId) && !incoming().diff(existing()).affectedKeys().hasAny(["role", "email"])) || isAdmin();
+      allow delete: if isAdmin() || (isSignedIn() && existing().email == request.auth.token.email);
+    }
+    
+    match /learnerProfiles/{userId} {
+      allow read: if canReadStudentRecord(userId);
+      allow list: if isInstructor() || isAdmin();
+      allow create, update: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin() || isOwner(userId);
+    }
+    
+    match /badges/{badgeId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+    
+    match /quizAttempts/{attemptId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow list: if isInstructor() || isAdmin();
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update: if isAdmin() || isOwnedOpenAttemptUpdate();
+      allow delete: if isAdmin() || (isSignedIn() && existing().userId == request.auth.uid);
+    }
+    
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isInstructor();
+    }
+    
+    match /topics/{topicId} {
+      allow read: if true;
+      allow write: if isInstructor();
+    }
+
+    match /reviewTracks/{trackId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /studentReviewSettings/{userId} {
+      allow read: if canReadStudentRecord(userId);
+      allow create, update: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /examBlueprints/{blueprintId} {
+      allow read: if true;
+      allow create, update: if isInstructor();
+      allow delete: if isAdmin();
+    }
+
+    match /questionBanks/{bankId} {
+      allow read, create, update: if isInstructor();
+      allow delete: if isAdmin();
+    }
+    
+    match /mockExamAttempts/{attemptId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow list: if isInstructor() || isAdmin();
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update: if isAdmin() || isOwnedOpenAttemptUpdate();
+      allow delete: if isAdmin() || (isSignedIn() && existing().userId == request.auth.uid);
+    }
+
+    match /mistakeBank/{mistakeId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow list: if isInstructor() || isAdmin();
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update: if isSignedIn() && (existing().userId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && (existing().userId == request.auth.uid || isAdmin());
+    }
+
+    match /questionExposures/{exposureId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow list: if isInstructor() || isAdmin();
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (existing().userId == request.auth.uid && incoming().userId == existing().userId)
+      );
+      allow delete: if isAdmin() || (isSignedIn() && existing().userId == request.auth.uid);
+    }
+    
+    match /modules/{moduleId} {
+      allow read: if true;
+      allow write: if isInstructor();
+    }
+
+    match /textbooks/{textbookId} {
+      allow read: if true;
+      allow write: if isInstructor();
+    }
+    
+    match /questions/{questionId} {
+      // Standard allowance + public allowance for sync
+      allow read: if isSignedIn() && (
+        resource.data.get('approved', false) == true || 
+        resource.data.get('isPublished', false) == true ||
+        isInstructor()
+      );
+      allow write: if isInstructor();
+    }
+
+    match /skills/{skillId} {
+      allow read: if true;
+      allow write: if isInstructor();
+    }
+
+    match /competencies/{competencyId} {
+      allow read: if true;
+      allow write: if isInstructor();
+    }
+    
+    match /classes/{classId} {
+      allow read: if true;
+      allow create: if isInstructor();
+      allow update: if isInstructor() && (existing().instructorId == request.auth.uid || existing().instructorEmail == request.auth.token.email || isAdmin());
+      allow delete: if isAdmin();
+    }
+    
+    match /classEnrollments/{enrollmentId} {
+      allow read: if isSignedIn() && (resource.data.studentId == request.auth.uid || isInstructor());
+      allow list: if isInstructor() || isAdmin();
+      allow create: if isSignedIn() && (incoming().studentId == request.auth.uid || instructorOwnsClass(incoming().classId));
+      allow update, delete: if isAdmin() || isOwner(existing().studentId) || instructorOwnsClass(existing().classId);
+    }
+    
+    match /diagnosticAttempts/{attemptId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow list: if isInstructor() || isAdmin();
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update: if isAdmin() || isOwnedOpenAttemptUpdate();
+      allow delete: if isAdmin() || (isSignedIn() && existing().userId == request.auth.uid);
+    }
+
+    match /moduleProgress/{progressId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow list: if isInstructor() || isAdmin();
+      allow create, update: if isSignedIn() && (incoming().userId == request.auth.uid || (resource != null && existing().userId == request.auth.uid));
+      allow delete: if isAdmin() || (isSignedIn() && existing().userId == request.auth.uid);
+    }
+
+    match /examAttemptLogs/{attemptId} {
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow update: if isAdmin();
+      allow delete: if isAdmin() || (isSignedIn() && existing().userId == request.auth.uid);
+    }
+
+    match /studyReminders/{reminderId} {
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow read, update, delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    match /learningNotes/{noteId} {
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update, delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    match /learningAnnotations/{annotationId} {
+      allow create: if isSignedIn() && isValidLearningAnnotation(incoming());
+      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.userId == request.auth.uid && incoming().userId == resource.data.userId && isValidLearningAnnotation(incoming()))
+      );
+    }
+
+    match /highlights/{highlightId} {
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow read, update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /hiddenBlocks/{blockId} {
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow read, update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /bookmarks/{bookmarkId} {
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow read, update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /contentVersions/{versionId} {
+      allow read: if isInstructor();
+      allow create: if isInstructor();
+      allow update, delete: if isAdmin();
+    }
+
+    match /moduleComments/{commentId} {
+      allow read, create: if isInstructor();
+      allow update: if isInstructor() || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /changeLogs/{logId} {
+      allow read: if isInstructor();
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+    
+    match /aiDrafts/{draftId} {
+      allow read, write: if isInstructor();
+    }
+    
+    match /studioPresence/{presenceId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn() && (incoming().userId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && (existing().userId == request.auth.uid || isAdmin());
+    }
+    
+    match /settings/{docId} {
+      allow read: if true;
+      allow write: if isInstructor() || isAdmin();
+    }
+    
+    match /system/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /reports/{reportId} {
+      allow create: if isSignedIn();
+      allow read, list, update, delete: if isAdmin();
+    }
+
+    match /notifications/{notificationId} {
+      allow create: if isInstructor() || isAdmin() || (
+        isSignedIn() &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().get('type', '') == 'grade_appeal'
+      );
+      allow read: if isSignedIn() && (
+        resource.data.get('recipientIds', []).hasAny([request.auth.uid]) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && resource.data.get('roleRecipients', []).hasAny([getUserData().get('role', 'student')])) ||
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        resource.data.get('recipientIds', []).hasAny([request.auth.uid]) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && resource.data.get('roleRecipients', []).hasAny([getUserData().get('role', 'student')])) ||
+        isAdmin()
+      ) && incoming().diff(existing()).affectedKeys().hasOnly(['readBy', 'status']);
+      allow delete: if isAdmin();
+    }
+
+    match /certificateTemplates/{templateId} {
+      allow read: if true;
+      allow create, update: if isInstructor();
+      allow delete: if isAdmin();
+    }
+
+    match /certificates/{certificateId} {
+      allow read: if true;
+      allow create, update: if isInstructor();
+      allow delete: if isAdmin();
+    }
+    
+    match /activityLogs/{logId} {
+      allow list, read: if isAdmin();
+      allow create: if isSignedIn();
+    }
+    
+    match /submissions/{submissionId} {
+      allow create: if isSignedIn();
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isInstructor());
+      allow update: if isInstructor();
+      allow delete: if isAdmin() || (isSignedIn() && existing().userId == request.auth.uid);
+    }
+  }
+}

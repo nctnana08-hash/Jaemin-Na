@@ -1,0 +1,8 @@
+{
+  "name": "Let Mastery",
+  "description": "Professional licensure exam preparation platform with preset curriculum domains, automated question seeding, and real-time performance tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
